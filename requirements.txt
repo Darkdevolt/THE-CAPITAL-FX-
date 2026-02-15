@@ -1,3 +1,7 @@
 streamlit
 yfinance
 plotly
+pandas
+lxml
+html5lib
+requests
