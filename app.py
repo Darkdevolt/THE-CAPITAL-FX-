@@ -3,159 +3,202 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from bs4 import BeautifulSoup
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="EUR/USD Auto-Dashboard", layout="wide")
+st.set_page_config(page_title="EUR/USD Pro Dashboard", layout="wide")
 
-# --- FONCTION DE SCRAPING (Le Moteur) ---
-@st.cache_data(ttl=3600) # Cache les données pour 1 heure pour ne pas spammer
-def get_macro_data():
+# --- FONCTION DE SCRAPING AVANCEE ---
+@st.cache_data(ttl=12 * 3600)  # Cache 12h
+def get_macro_data_robust():
+    # Valeurs par défaut (si tout échoue)
+    fed = 5.50
+    ecb = 3.25
+    us_cpi = 3.1
+    eu_cpi = 2.6
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
+    status_log = []
+
     try:
-        # 1. Scraper les Taux d'Intérêt (Wikipedia est très stable pour ça)
-        url_rates = "https://en.wikipedia.org/wiki/List_of_countries_by_central_bank_interest_rates"
-        tables_rates = pd.read_html(url_rates)
-        df_rates = tables_rates[0] # Le premier tableau est généralement le bon
+        # TENTATIVE 1 : Scraper Global-Rates (souvent plus facile que Trading Economics)
+        # On ne peut pas scraper TradingEconomics facilement car ils ont des protections Cloudflare.
+        # On va utiliser une méthode hybride : Yahoo Finance pour les taux 10 ans (Sentiment) et valeurs fixes modifiables.
         
-        # Nettoyage et recherche
-        # On cherche "United States" et "Euro area"
-        us_row = df_rates[df_rates.iloc[:, 0].str.contains("United States", case=False, na=False)].iloc[0]
-        eu_row = df_rates[df_rates.iloc[:, 0].str.contains("Euro area", case=False, na=False)].iloc[0]
+        # Pour cet exemple, on va simuler le scraping via Wikipedia avec le User-Agent (ce qui règle souvent le problème)
+        url = "https://en.wikipedia.org/wiki/List_of_countries_by_central_bank_interest_rates"
+        response = requests.get(url, headers=headers)
         
-        fed_rate = float(str(us_row.iloc[2]).replace('%', '').replace('−', '-'))
-        ecb_rate = float(str(eu_row.iloc[2]).replace('%', '').replace('−', '-'))
-
-        # 2. Scraper l'Inflation (CPI)
-        url_cpi = "https://en.wikipedia.org/wiki/List_of_countries_by_inflation_rate"
-        tables_cpi = pd.read_html(url_cpi)
-        df_cpi = tables_cpi[0] # Souvent le premier tableau
-
-        # Note: La structure de wikipedia change parfois, on essaie de trouver les colonnes
-        us_cpi_row = df_cpi[df_cpi.iloc[:, 0].str.contains("United States", case=False, na=False)].iloc[0]
-        eu_cpi_row = df_cpi[df_cpi.iloc[:, 0].str.contains("Euro area", case=False, na=False)].iloc[0]
-
-        # L'index de la colonne taux change parfois, on prend souvent la colonne 1 ou 2
-        us_cpi = float(str(us_cpi_row.iloc[1]).replace('%', '').replace('−', '-'))
-        eu_cpi = float(str(eu_cpi_row.iloc[1]).replace('%', '').replace('−', '-'))
-        
-        return fed_rate, ecb_rate, us_cpi, eu_cpi, True
+        if response.status_code == 200:
+            tables = pd.read_html(response.text)
+            df = tables[0]
+            
+            # Nettoyage Fed
+            us_row = df[df.iloc[:, 0].str.contains("United States", case=False, na=False)].iloc[0]
+            fed = float(str(us_row.iloc[2]).replace('%', '').replace('−', '-').split('[')[0])
+            
+            # Nettoyage BCE
+            eu_row = df[df.iloc[:, 0].str.contains("Euro area", case=False, na=False)].iloc[0]
+            ecb = float(str(eu_row.iloc[2]).replace('%', '').replace('−', '-').split('[')[0])
+            
+            status_log.append("✅ Taux Central Bank récupérés via Wikipedia")
+        else:
+            status_log.append("⚠️ Echec connexion Wikipedia")
 
     except Exception as e:
-        # Si le scraping échoue, on retourne des valeurs par défaut
-        return 5.50, 4.00, 3.4, 2.9, False
+        status_log.append(f"⚠️ Erreur Scraping Taux: {str(e)}")
+
+    try:
+        # TENTATIVE 2 : Inflation (CPI)
+        url_cpi = "https://en.wikipedia.org/wiki/List_of_countries_by_inflation_rate"
+        response_cpi = requests.get(url_cpi, headers=headers)
+        if response_cpi.status_code == 200:
+            df_cpi = pd.read_html(response_cpi.text)[0]
+            
+            # US CPI
+            us_cpi_row = df_cpi[df_cpi.iloc[:, 0].str.contains("United States", case=False, na=False)].iloc[0]
+            us_cpi = float(str(us_cpi_row.iloc[1]).replace('%', '').replace('−', '-').split('[')[0])
+            
+            # EU CPI
+            eu_cpi_row = df_cpi[df_cpi.iloc[:, 0].str.contains("Euro area", case=False, na=False)].iloc[0]
+            eu_cpi = float(str(eu_cpi_row.iloc[1]).replace('%', '').replace('−', '-').split('[')[0])
+            
+            status_log.append("✅ Inflation récupérée")
+    except Exception as e:
+        status_log.append(f"⚠️ Erreur Scraping Inflation: {str(e)}")
+
+    return fed, ecb, us_cpi, eu_cpi, status_log
 
 # --- RECUPERATION DES DONNEES ---
-fed_rate, ecb_rate, us_cpi, eu_cpi, scraping_success = get_macro_data()
 
-# Récupération Yields (Obligations) pour le sentiment
-tickers = yf.tickers.Tickers("^TNX ^FVX EURUSD=X") # TNX = 10 ans US
+# 1. Macro (Scraping ou Défaut)
+fed_rate, ecb_rate, us_cpi, eu_cpi, logs = get_macro_data_robust()
+
+# 2. Yields (Obligations) via Yahoo (Très fiable)
 try:
-    tnx_data = yf.download("^TNX", period="5d", progress=False)['Close']
-    us_10y_current = tnx_data.iloc[-1].item()
-    us_10y_prev = tnx_data.iloc[-2].item()
-    delta_yield = us_10y_current - us_10y_prev
+    bond_tickers = yf.Tickers("^TNX ^FVX") # TNX = 10 ans, FVX = 5 ans
+    tnx_hist = bond_tickers.tickers["^TNX"].history(period="5d")
+    us_10y = tnx_hist['Close'].iloc[-1]
+    us_10y_prev = tnx_hist['Close'].iloc[-2]
+    yield_delta = us_10y - us_10y_prev
 except:
-    us_10y_current = 4.0
-    delta_yield = 0
+    us_10y = 4.0
+    yield_delta = 0
 
-# --- INTERFACE UTILISATEUR ---
+# --- SIDEBAR INTELLIGENTE (MODE MANUEL SI BESOIN) ---
+st.sidebar.title("🎛️ Panneau de Contrôle")
+st.sidebar.markdown("Si le scraping échoue, corrige les valeurs ici.")
 
-st.title("🤖 EUR/USD : Auto-Pilote Fondamental")
-st.markdown("---")
+# On pré-remplit les inputs avec les valeurs scrapées
+input_fed = st.sidebar.number_input("Taux FED (%)", value=fed_rate, step=0.25)
+input_ecb = st.sidebar.number_input("Taux BCE (%)", value=ecb_rate, step=0.25)
+input_us_cpi = st.sidebar.number_input("CPI US (%)", value=us_cpi, step=0.1)
+input_eu_cpi = st.sidebar.number_input("CPI EU (%)", value=eu_cpi, step=0.1)
 
-if scraping_success:
-    st.toast("Données Macro mises à jour automatiquement !", icon="✅")
-else:
-    st.warning("⚠️ Le scraping a échoué. Valeurs par défaut utilisées. Vérifie ta connexion.")
+# Status Logs
+with st.expander("Journal de connexion (Debug)"):
+    for log in logs:
+        st.write(log)
 
-# SIDEBAR (Juste pour vérifier, mais tout est auto)
-st.sidebar.header("Données en Direct")
-st.sidebar.metric("Taux FED (USA)", f"{fed_rate}%")
-st.sidebar.metric("Taux BCE (EU)", f"{ecb_rate}%")
-st.sidebar.markdown("---")
-st.sidebar.metric("Inflation USA", f"{us_cpi}%")
-st.sidebar.metric("Inflation EU", f"{eu_cpi}%")
+# --- LOGIQUE TRADING (LE CERVEAU) ---
+# Spread Taux
+spread = input_fed - input_ecb
+# Spread Inflation
+inf_spread = input_us_cpi - input_eu_cpi
 
-# --- ALGORITHME DE DECISION ---
-
-# Calcul Spread
-spread_rate = fed_rate - ecb_rate
-spread_cpi = us_cpi - eu_cpi
-
-# Calcul Sentiment via Bond Yields (Si le taux 10 ans monte, le Dollar monte)
-sentiment_score = 0
-if delta_yield > 0.05:
-    sentiment_txt = "Yields US en Hausse (Pro-USD)"
-    sentiment_score = -2
-elif delta_yield < -0.05:
-    sentiment_txt = "Yields US en Baisse (Anti-USD)"
-    sentiment_score = 2
-else:
-    sentiment_txt = "Yields Stables"
-    sentiment_score = 0
-
-# Scoring Total
 score = 0
-# Taux
-if spread_rate > 1.0: score -= 3
-elif spread_rate > 0: score -= 1
-else: score += 2
-# Inflation
-if us_cpi > eu_cpi: score -= 1 # Fed doit monter les taux -> USD fort
-else: score += 1
-# Sentiment
-score += sentiment_score
+reasons = []
 
-# --- AFFICHAGE DU DASHBOARD ---
+# 1. Analyse des Taux (Le plus important)
+if spread > 1.25:
+    score -= 3
+    reasons.append("📉 L'écart de taux est énorme en faveur du Dollar (>1.25%).")
+elif spread > 0.5:
+    score -= 1
+    reasons.append("📉 Les taux US sont supérieurs aux taux EU.")
+elif spread < -0.5:
+    score += 2
+    reasons.append("📈 Les taux EU sont supérieurs, l'Euro devient attractif.")
 
-c1, c2, c3 = st.columns(3)
+# 2. Analyse des Obligations (Le sentiment immédiat)
+if yield_delta > 0.03:
+    score -= 2
+    reasons.append("🔥 Les taux obligataires US (10 ans) montent fort aujourd'hui (Dollar Fort).")
+elif yield_delta < -0.03:
+    score += 2
+    reasons.append("❄️ Les taux obligataires US se détendent (Dollar Faible).")
 
-with c1:
-    st.subheader("Biais Directionnel")
-    if score < 0:
-        st.markdown(f"<h1 style='color: #FF4B4B;'>VENDRE (Short)</h1>", unsafe_allow_html=True)
-        st.write(f"Score Macro: {score}/10")
+# 3. Analyse Inflation
+if input_us_cpi > input_eu_cpi + 1:
+    score -= 1
+    reasons.append("⚠️ Inflation US plus forte : La FED gardera ses taux hauts.")
+
+# --- INTERFACE VISUELLE ---
+
+st.title("💶/💵 EURUSD : Techno-Fundamental Dashboard")
+
+# Affichage du Biais
+col_main, col_score = st.columns([2, 1])
+
+with col_score:
+    st.write("### Biais Actuel")
+    if score <= -2:
+        st.error(f"FORTEMENT VENDEUR ({score})")
+    elif score < 0:
+        st.warning(f"VENDEUR ({score})")
+    elif score >= 2:
+        st.success(f"FORTEMENT ACHETEUR (+{score})")
     elif score > 0:
-        st.markdown(f"<h1 style='color: #4CAF50;'>ACHETER (Long)</h1>", unsafe_allow_html=True)
-        st.write(f"Score Macro: {score}/10")
+        st.info(f"ACHETEUR (+{score})")
     else:
-        st.markdown(f"<h1 style='color: gray;'>NEUTRE</h1>", unsafe_allow_html=True)
+        st.write("NEUTRE / INCERTAIN")
+    
+    st.metric("Spread Taux (Fed-BCE)", f"{spread:.2f}%")
+    st.metric("US 10Y Yield", f"{us_10y:.2f}%", f"{yield_delta:.3f}")
+
+with col_main:
+    # Graphique Technique
+    data = yf.download("EURUSD=X", period="6mo", interval="1d", progress=False)
+    fig = go.Figure()
+    
+    # Bougies
+    fig.add_trace(go.Candlestick(x=data.index,
+                    open=data['Open'], high=data['High'],
+                    low=data['Low'], close=data['Close'], name='Prix'))
+    
+    # Moyenne Mobile 50 (Tendance court terme)
+    fig.add_trace(go.Scatter(x=data.index, y=data['Close'].rolling(50).mean(), line=dict(color='orange', width=1.5), name='MM 50'))
+    
+    # Zone de Biais
+    last_price = data['Close'].iloc[-1].item()
+    if score < 0:
+        fig.add_hrect(y0=last_price, y1=last_price*1.02, fillcolor="red", opacity=0.1, annotation_text="Chercher Ventes")
+    elif score > 0:
+        fig.add_hrect(y0=last_price*0.98, y1=last_price, fillcolor="green", opacity=0.1, annotation_text="Chercher Achats")
+
+    fig.update_layout(title="EURUSD Daily + MM50", height=400, template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# --- PLAN D'ACTION ---
+c1, c2 = st.columns(2)
+with c1:
+    st.subheader("🧠 Analyse Fondamentale")
+    for r in reasons:
+        st.write(f"- {r}")
 
 with c2:
-    st.subheader("Sentiment (Bonds US)")
-    st.metric("US 10Y Yield", f"{us_10y_current:.2f}%", f"{delta_yield:.3f}")
-    st.caption(sentiment_txt)
-
-with c3:
-    # Récup prix EURUSD
-    df_price = yf.download("EURUSD=X", period="1y", interval="1d", progress=False)
-    curr_price = df_price['Close'].iloc[-1].item()
-    prev_close = df_price['Close'].iloc[-2].item()
-    st.subheader("Prix EUR/USD")
-    st.metric("Cours Actuel", f"{curr_price:.4f}", f"{curr_price-prev_close:.4f}")
-
-# --- ANALYSE GRAPHIQUE ---
-st.markdown("### 🔍 Analyse Croisée")
-
-# Graphique
-fig = go.Figure()
-fig.add_trace(go.Candlestick(x=df_price.index,
-                open=df_price['Open'], high=df_price['High'],
-                low=df_price['Low'], close=df_price['Close'], name='EUR/USD'))
-
-# Ajout d'une zone de couleur selon le biais
-if score < 0:
-    # Zone rouge légère en fond si biais vendeur
-    fig.add_hrect(y0=curr_price, y1=curr_price*1.05, line_width=0, fillcolor="red", opacity=0.1, annotation_text="Zone de Vente (Résistance)")
-elif score > 0:
-    fig.add_hrect(y0=curr_price*0.95, y1=curr_price, line_width=0, fillcolor="green", opacity=0.1, annotation_text="Zone d'Achat (Support)")
-
-fig.update_layout(height=450, template="plotly_dark", title="EUR/USD + Context Macro")
-st.plotly_chart(fig, use_container_width=True)
-
-# --- EXPLICATION LOGIQUE ---
-st.info(f"""
-**Pourquoi ce Biais ?**
-1. **Spread de Taux :** L'écart est de {spread_rate:.2f}%. {'Avantage Dollar' if spread_rate > 0 else 'Avantage Euro'}.
-2. **Sentiment (US 10Y) :** Les taux obligataires US sont à {us_10y_current:.2f}% ({sentiment_txt}).
-3. **Inflation :** US ({us_cpi}%) vs EU ({eu_cpi}%).
-""")
+    st.subheader("⚔️ Exécution Technique")
+    if score < 0:
+        st.write("1. Attendre un rebond vers une résistance (ou la MM50).")
+        st.write("2. Chercher un signal de retournement (Pinbar, Englobante) en H1/H4.")
+        st.write("3. **Ne pas acheter** tant que le 10Y US Yield monte.")
+    elif score > 0:
+        st.write("1. Attendre un repli sur support.")
+        st.write("2. Valider l'entrée si le Dollar Index (DXY) baisse.")
+    else:
+        st.write("Marché indécis. Privilégier le scalping sur les bornes de range (M15).")
