@@ -3,162 +3,150 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import requests
-from datetime import datetime
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="EUR/USD Sentinelle", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="EUR/USD TradingEconomics", layout="wide", page_icon="🇪🇺🇺🇸")
 
-# --- FONCTION DE RECUPERATION ROBUSTE ---
-@st.cache_data(ttl=3600*12)
-def get_safe_data():
-    # 1. VALEURS DE SECOURS (Mises à jour Février 2026 - ou actuelles)
-    # Si tout le reste échoue, l'appli utilisera ça pour ne pas planter.
-    # Tu peux modifier ces valeurs manuellement ici si besoin.
-    data = {
-        "fed_rate": 5.50, # Taux actuel approx
-        "ecb_rate": 4.50, # Taux actuel approx
-        "us_cpi": 3.4,
-        "eu_cpi": 2.8,
-        "source": "Backup (Mode Manuel)"
+# --- FONCTION DE SCRAPING (CIBLE: TRADING ECONOMICS) ---
+@st.cache_data(ttl=3600)
+def get_te_data():
+    # On se fait passer pour un vrai navigateur Chrome
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
     }
-    
-    # 2. TENTATIVE SCRAPING INTELLIGENT (WIKIPEDIA)
-    # On utilise un User-Agent pour passer pour un navigateur
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        
-        # --- Taux Directeurs ---
-        url_rates = "https://en.wikipedia.org/wiki/List_of_countries_by_central_bank_interest_rates"
-        tables = pd.read_html(requests.get(url_rates, headers=headers).text)
-        
-        # On cherche le tableau qui contient "United States"
-        for df in tables:
-            if "United States" in str(df.iloc[:, 0].values):
-                # On nettoie les données
-                us_row = df[df.iloc[:, 0].str.contains("United States", na=False)].iloc[0]
-                eu_row = df[df.iloc[:, 0].str.contains("Euro area", na=False)].iloc[0]
-                
-                # On cherche la première colonne qui contient un chiffre avec un %
-                # C'est plus robuste que de dire "colonne 2"
-                for col_idx in range(1, len(df.columns)):
-                    val = str(us_row.iloc[col_idx])
-                    if "%" in val:
-                        data["fed_rate"] = float(val.replace('%', '').replace('−', '-').split('[')[0])
-                        data["ecb_rate"] = float(str(eu_row.iloc[col_idx]).replace('%', '').replace('−', '-').split('[')[0])
-                        data["source"] = "Wikipedia Live"
-                        break
-                break
 
-        # --- Inflation ---
-        url_cpi = "https://en.wikipedia.org/wiki/List_of_countries_by_inflation_rate"
-        tables_cpi = pd.read_html(requests.get(url_cpi, headers=headers).text)
+    data = {
+        "fed": 5.50, "ecb": 4.50, "us_cpi": 3.4, "eu_cpi": 2.8, # Valeurs par défaut si blocage
+        "status": "⚠️ Mode Secours (TE a bloqué le script)"
+    }
+
+    try:
+        # 1. RECUPERATION DES TAUX (Interest Rate Page)
+        url_rates = "https://tradingeconomics.com/country-list/interest-rate"
+        r = requests.get(url_rates, headers=headers, timeout=10)
         
-        for df in tables_cpi:
-            if "United States" in str(df.iloc[:, 0].values):
-                 us_row = df[df.iloc[:, 0].str.contains("United States", na=False)].iloc[0]
-                 eu_row = df[df.iloc[:, 0].str.contains("Euro area", na=False)].iloc[0]
-                 
-                 # Recherche colonne inflation
-                 for col_idx in range(1, len(df.columns)):
-                    val = str(us_row.iloc[col_idx])
-                    if "." in val or "%" in val: # Cherche un chiffre
-                        try:
-                            clean_val = float(val.replace('%', '').replace('−', '-').split('[')[0])
-                            if 0 < clean_val < 50: # Check de cohérence
-                                data["us_cpi"] = clean_val
-                                data["eu_cpi"] = float(str(eu_row.iloc[col_idx]).replace('%', '').replace('−', '-').split('[')[0])
-                                break
-                        except:
-                            continue
-                 break
+        if r.status_code == 200:
+            dfs = pd.read_html(r.text)
+            df_rates = dfs[0] # Le tableau principal
+            
+            # On cherche USA et Euro Area
+            # Trading Economics écrit parfois "United States" ou "USA"
+            us_row = df_rates[df_rates.iloc[:,0].str.contains("United States", case=False, na=False)]
+            eu_row = df_rates[df_rates.iloc[:,0].str.contains("Euro Area", case=False, na=False)]
+            
+            if not us_row.empty:
+                data["fed"] = float(us_row.iloc[0, 1]) # Colonne 1 = Last
+            if not eu_row.empty:
+                data["ecb"] = float(eu_row.iloc[0, 1])
+                
+            data["status"] = "✅ Données Trading Economics (Taux)"
+
+        # 2. RECUPERATION INFLATION (Inflation Rate Page)
+        url_cpi = "https://tradingeconomics.com/country-list/inflation-rate"
+        r_cpi = requests.get(url_cpi, headers=headers, timeout=10)
+        
+        if r_cpi.status_code == 200:
+            dfs_cpi = pd.read_html(r_cpi.text)
+            df_cpi = dfs_cpi[0]
+            
+            us_row = df_cpi[df_cpi.iloc[:,0].str.contains("United States", case=False, na=False)]
+            eu_row = df_cpi[df_cpi.iloc[:,0].str.contains("Euro Area", case=False, na=False)]
+            
+            if not us_row.empty:
+                data["us_cpi"] = float(us_row.iloc[0, 1])
+            if not eu_row.empty:
+                data["eu_cpi"] = float(eu_row.iloc[0, 1])
+                
+            data["status"] = "✅ Données Trading Economics (Complet)"
 
     except Exception as e:
-        # En cas d'erreur, on ne fait RIEN. On garde les valeurs de secours.
-        print(f"Erreur scraping: {e}")
-        pass
-
+        data["status"] = f"Erreur: {str(e)}"
+    
     return data
 
-# --- RECUPERATION YIELD (YAHOO - TRES ROBUSTE) ---
-def get_market_sentiment():
-    try:
-        # TNX = 10 Year Treasury Yield
-        ticker = yf.Ticker("^TNX")
-        hist = ticker.history(period="5d")
-        current = hist['Close'].iloc[-1]
-        prev = hist['Close'].iloc[-2]
-        change = current - prev
-        return current, change
-    except:
-        return 4.0, 0.0
+# --- RECUPERATION MARKET DATA (YAHOO) ---
+def get_market():
+    # TNX = Taux 10 ans US
+    tickers = yf.Tickers("EURUSD=X ^TNX")
+    tnx = tickers.tickers["^TNX"].history(period="5d")
+    eur = tickers.tickers["EURUSD=X"].history(period="1mo")
+    
+    us10y = tnx['Close'].iloc[-1]
+    us10y_chg = us10y - tnx['Close'].iloc[-2]
+    
+    price = eur['Close'].iloc[-1]
+    
+    return us10y, us10y_chg, price, eur
 
-# --- MAIN APP ---
+# --- EXECUTION ---
+macro = get_te_data()
+us10y, us10y_chg, price, df_eur = get_market()
 
-macro_data = get_safe_data()
-us_10y, us_10y_change = get_market_sentiment()
+# --- INTERFACE ---
+st.title("🇪🇺/🇺🇸 Dashboard Pro (Source: Trading Economics)")
 
-# SIDEBAR (Toujours modifiable)
-st.sidebar.header("🔧 Réglages")
-st.sidebar.caption(f"Source actuelle : {macro_data['source']}")
-input_fed = st.sidebar.number_input("Taux FED", value=macro_data['fed_rate'])
-input_ecb = st.sidebar.number_input("Taux BCE", value=macro_data['ecb_rate'])
-input_us_cpi = st.sidebar.number_input("CPI US", value=macro_data['us_cpi'])
-input_eu_cpi = st.sidebar.number_input("CPI EU", value=macro_data['eu_cpi'])
+# Affichage du statut de la connexion
+if "✅" in macro["status"]:
+    st.success(macro["status"])
+else:
+    st.warning(f"{macro['status']} -> Valeurs par défaut utilisées. (Trading Economics bloque souvent les robots)")
 
-# LOGIQUE DE DECISION
+# SIDEBAR DE CONTROLE
+st.sidebar.header("Données Macro")
+fed = st.sidebar.number_input("🇺🇸 Taux FED", value=macro["fed"])
+ecb = st.sidebar.number_input("🇪🇺 Taux BCE", value=macro["ecb"])
+us_cpi = st.sidebar.number_input("🇺🇸 CPI (Inflation)", value=macro["us_cpi"])
+eu_cpi = st.sidebar.number_input("🇪🇺 CPI (Inflation)", value=macro["eu_cpi"])
+
+# LOGIQUE DE BIAIS
 score = 0
-reasons = []
+rate_diff = fed - ecb
+cpi_diff = us_cpi - eu_cpi
 
 # 1. Taux
-spread = input_fed - input_ecb
-if spread > 1.0: 
-    score -= 2
-    reasons.append("Taux: Gros avantage Dollar (Spread > 1%)")
-elif spread < 0: 
-    score += 2
-    reasons.append("Taux: Avantage Euro")
+if rate_diff > 1.0: score -= 3 # USD très fort
+elif rate_diff > 0.25: score -= 1
+elif rate_diff < -0.25: score += 1
+elif rate_diff < -1.0: score += 3 # EUR très fort
 
-# 2. Yields (Dynamique)
-if us_10y_change > 0.04:
-    score -= 3 # Le marché a peur, il achète du dollar
-    reasons.append("⚠️ ALERTE: Les taux US montent fort aujourd'hui (Vente EURUSD)")
-elif us_10y_change < -0.04:
-    score += 3
-    reasons.append("✅ SIGNAL: Les taux US chutent (Achat EURUSD)")
+# 2. Dynamique Inflation (Si inflation US > EU, la Fed garde les taux hauts -> USD fort)
+if cpi_diff > 1.0: score -= 1
+elif cpi_diff < -1.0: score += 1
 
-# 3. Inflation
-if input_us_cpi > input_eu_cpi:
-    score -= 1
-else:
-    score += 1
+# 3. Sentiment (Yields)
+if us10y_chg > 0.05: score -= 2
+elif us10y_chg < -0.05: score += 2
 
-# INTERFACE
-st.title("🛡️ EUR/USD : Sentinelle Macro")
-
+# AFFICHAGE KPI
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.metric("Taux FED vs BCE", f"{input_fed}% / {input_ecb}%", f"Ecart: {spread:.2f}%")
+    st.metric("Spread Taux (Fed - BCE)", f"{rate_diff:.2f}%")
 with c2:
-    st.metric("US 10Y Yield (Sentiment)", f"{us_10y:.2f}%", f"{us_10y_change:.3f}")
+    st.metric("Spread Inflation (US - EU)", f"{cpi_diff:.2f}%")
 with c3:
+    st.metric("US 10Y Yield", f"{us10y:.2f}%", f"{us10y_chg:.3f}")
+
+st.divider()
+
+# DECISION
+col_bias, col_chart = st.columns([1, 2])
+
+with col_bias:
+    st.subheader("Biais Directionnel")
     if score < 0:
-        st.error(f"📉 BIAIS : VENDEUR ({score})")
+        st.markdown("## 🔴 VENDRE (Short)")
+        st.write("Le fondamental favorise le **DOLLAR**.")
+        st.info("Cherche des résistances pour vendre.")
     elif score > 0:
-        st.success(f"📈 BIAIS : ACHETEUR (+{score})")
+        st.markdown("## 🟢 ACHETER (Long)")
+        st.write("Le fondamental favorise l'**EURO**.")
+        st.info("Cherche des supports pour acheter.")
     else:
-        st.info("⚖️ BIAIS : NEUTRE")
+        st.markdown("## ⚪ NEUTRE")
+        st.write("Pas d'avantage clair.")
 
-# GRAPHIQUE
-st.markdown("---")
-df = yf.download("EURUSD=X", period="3mo", interval="1d", progress=False)
-fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'])])
-fig.update_layout(title="EUR/USD (Daily)", height=400, template="plotly_dark")
-
-# Ajout d'une ligne de tendance automatique (MM20)
-fig.add_trace(go.Scatter(x=df.index, y=df['Close'].rolling(20).mean(), line=dict(color='orange'), name='MM 20'))
-
-st.plotly_chart(fig, use_container_width=True)
-
-st.subheader("📝 Pourquoi ?")
-for r in reasons:
-    st.write(f"- {r}")
+with col_chart:
+    fig = go.Figure(data=[go.Candlestick(x=df_eur.index, open=df_eur['Open'], high=df_eur['High'], low=df_eur['Low'], close=df_eur['Close'])])
+    fig.update_layout(title="EUR/USD (Dernier mois)", height=350, margin=dict(t=30, l=0, r=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
